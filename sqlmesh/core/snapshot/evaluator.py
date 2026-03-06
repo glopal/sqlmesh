@@ -51,7 +51,7 @@ from sqlmesh.core.model import (
     ViewKind,
     CustomKind,
 )
-from sqlmesh.core.model.kind import _Incremental, DbtCustomKind
+from sqlmesh.core.model.kind import _Incremental, _SCDType2Kind, IncrementalByTimeRangeKind, DbtCustomKind
 from sqlmesh.utils import CompletionStatus, columns_to_types_all_known
 from sqlmesh.core.schema_diff import (
     has_drop_alteration,
@@ -2026,6 +2026,60 @@ class PromotableStrategy(EvaluationStrategy, abc.ABC):
         self.adapter.execute(snapshot.model.render_post_statements(**render_kwargs))
 
 
+class PgIndexCreationMixin:
+    """Creates PostgreSQL indexes on physical tables after creation."""
+
+    def _create_pg_indexes(self, table_name: str, model: Model) -> None:
+        dialect = self.adapter.dialect
+        if dialect == "postgres":
+            use_raw_sql = False
+        elif dialect == "duckdb":
+            # Check if the table's catalog is a postgres-attached database
+            table = exp.to_table(table_name)
+            catalog = (table.catalog or "").replace('"', '')
+            if not catalog:
+                return
+            try:
+                rows = self.adapter.fetchall("SELECT type FROM duckdb_databases() WHERE database_name = '{}'".format(catalog))
+                if not rows or rows[0][0] != "postgres":
+                    return
+            except Exception:
+                return
+            use_raw_sql = True
+        else:
+            return
+
+        table = exp.to_table(table_name)
+        # Use just the table name (without catalog/schema) to stay within
+        # Postgres's 63-character identifier limit.
+        tbl = table.name.replace('"', '')
+        prefix = tbl[:40]  # leave room for idx_ prefix + column suffix
+
+        def _unquote(s: str) -> str:
+            return str(s).replace('"', '').replace("'", '')
+
+        def _do_create_index(idx_name: str, columns: t.Tuple[str, ...]) -> None:
+            if use_raw_sql:
+                cols = ", ".join(f'"{c}"' for c in columns)
+                sql = f'CREATE INDEX IF NOT EXISTS "{idx_name}" ON {table.sql(dialect="duckdb")} ({cols})'
+                self.adapter.execute(sql)
+            else:
+                self.adapter.create_index(table_name, idx_name, columns)
+
+        if isinstance(model.kind, _SCDType2Kind):
+            # Index on unique_key columns
+            key_cols = tuple(_unquote(k) for k in model.kind.unique_key)
+            key_suffix = "_".join(key_cols)
+            _do_create_index(f"idx_{prefix}_{key_suffix}"[:63], key_cols)
+            # Index on valid_to
+            valid_to = _unquote(model.kind.valid_to_name)
+            _do_create_index(f"idx_{prefix}_{valid_to}"[:63], (valid_to,))
+
+        elif isinstance(model.kind, IncrementalByTimeRangeKind):
+            time_col = _unquote(model.kind.time_column.column)
+            _do_create_index(f"idx_{prefix}_{time_col}"[:63], (time_col,))
+
+
 class MaterializableStrategy(PromotableStrategy, abc.ABC):
     def create(
         self,
@@ -2251,7 +2305,19 @@ class IncrementalByPartitionStrategy(IncrementalStrategy):
             )
 
 
-class IncrementalByTimeRangeStrategy(IncrementalStrategy):
+class IncrementalByTimeRangeStrategy(PgIndexCreationMixin, IncrementalStrategy):
+    def create(
+        self,
+        table_name: str,
+        model: Model,
+        is_table_deployable: bool,
+        render_kwargs: t.Dict[str, t.Any],
+        skip_grants: bool,
+        **kwargs: t.Any,
+    ) -> None:
+        super().create(table_name, model, is_table_deployable, render_kwargs, skip_grants, **kwargs)
+        self._create_pg_indexes(table_name, model)
+
     def insert(
         self,
         table_name: str,
@@ -2510,7 +2576,7 @@ class SeedStrategy(MaterializableStrategy):
         pass
 
 
-class SCDType2Strategy(IncrementalStrategy):
+class SCDType2Strategy(PgIndexCreationMixin, IncrementalStrategy):
     def create(
         self,
         table_name: str,
@@ -2557,6 +2623,8 @@ class SCDType2Strategy(IncrementalStrategy):
             self._apply_grants(
                 model, table_name, GrantsTargetLayer.PHYSICAL, is_snapshot_deployable
             )
+
+        self._create_pg_indexes(table_name, model)
 
     def insert(
         self,
